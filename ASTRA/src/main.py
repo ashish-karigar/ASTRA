@@ -17,7 +17,7 @@ class TitleBar(tk.Frame):
         super().__init__(master, bg="#A63131", height=60)
         self.master = master
 
-        logo_image = Image.open("../../assets/logo.png")
+        logo_image = Image.open("../assets/logo.png")
         logo_image = logo_image.resize((40, 40))
         self.logo_photo = ImageTk.PhotoImage(logo_image)
 
