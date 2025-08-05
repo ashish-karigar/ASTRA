@@ -17,7 +17,7 @@ class TitleBar(tk.Frame):
         super().__init__(master, bg="#A63131", height=60)
         self.master = master
 
-        logo_image = Image.open("../assets/logo.png")
+        logo_image = Image.open(self.resource_path("../assets/logo.png"))
         logo_image = logo_image.resize((40, 40))
         self.logo_photo = ImageTk.PhotoImage(logo_image)
 
@@ -32,6 +32,16 @@ class TitleBar(tk.Frame):
             bg="#A63131"
         )
         title_label.pack(side="left", pady=10)
+
+    def resource_path(self, relative_path):
+        """Get absolute path to resource, works for dev and PyInstaller"""
+        try:
+            # PyInstaller stores files in a temp folder called _MEIPASS
+            base_path = sys._MEIPASS
+        except AttributeError:
+            base_path = os.path.abspath(".")
+
+        return os.path.join(base_path, relative_path)
 
 
 class WatchHandler(FileSystemEventHandler):
@@ -389,7 +399,6 @@ class MainFrame(tk.Frame):
         if selected_path:
             self.dest_path = selected_path  # Save for disk usage calculations
             self.update_disk_health()
-
 
 
 
