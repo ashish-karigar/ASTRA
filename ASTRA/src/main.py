@@ -110,7 +110,7 @@ class MainFrame(tk.Frame):
         next_backup_label = tk.Label(self.sidebar, text="Next backup in:", font=("Arial", 18), bg="#1E1E1E", anchor="w")
         next_backup_label.pack(pady=(30, 2), padx=10, anchor="w")
 
-        self.backup_timer_label = tk.Label(self.sidebar, text="00:00:00", font=("Digital-7 Mono", 100), fg="white", bg="#1E1E1E")
+        self.backup_timer_label = tk.Label(self.sidebar, text="00:00:00", font=("Digital-7 Mono", 70), fg="white", bg="#1E1E1E")
         self.backup_timer_label.pack(pady=2, padx=10, anchor="w")
 
         self.update_backup_timer_label()
