@@ -1,4 +1,0 @@
-([('astra',
-   '/Users/ashishkarigar/Projects/projects/Coding/Windows '
-   'Application/ASTRA/ASTRA/src/dist/astra',
-   'EXECUTABLE')],)
