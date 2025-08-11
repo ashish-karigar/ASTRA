@@ -10,6 +10,8 @@ from watchdog.events import FileSystemEventHandler
 import threading
 import shutil
 from datetime import datetime
+import queue
+import math
 
 
 class TitleBar(tk.Frame):
@@ -87,6 +89,14 @@ class MainFrame(tk.Frame):
         self.observer = None
         self.timer_running = False
         self.timer_paused = False
+
+        self.stop_event = threading.Event()  # to request cancellation
+        self.sync_thread = None  # background sync thread
+        self.msg_queue = queue.Queue()  # thread-safe queue for UI messages
+        self.total_bytes_to_copy = 0
+        self.bytes_copied = 0
+        self.total_files_to_process = 0
+        self.files_processed = 0
 
         screen_width = master.winfo_screenwidth()
         screen_height = master.winfo_screenheight()
@@ -213,6 +223,9 @@ class MainFrame(tk.Frame):
         sys.stdout = self
         sys.stderr = self
 
+        # Start periodic queue polling
+        self.after(200, self._poll_msg_queue)
+
     def update_timer(self):
         try:
             new_interval = int(self.backup_interval_entry.get())
@@ -296,6 +309,7 @@ class MainFrame(tk.Frame):
         self.timer_running = True
         self.remaining_seconds = self.backup_interval * 60
         self.update_backup_timer_label()
+        # start countdown normally; when it reaches 0 it will call perform_backup (modified below)
         self.countdown()
         print("Monitoring started.")
         self.start_watchdog()
@@ -305,17 +319,13 @@ class MainFrame(tk.Frame):
         self.timer_paused = False
         self.backup_timer_label.config(text="00:00:00")
         print("Monitoring stopped.")
+        # cancel running sync (if any)
+        self.cancel_sync()
         self.stop_watchdog()
 
     def perform_backup(self):
-        source_dir = self.path_var1.get()
-        dest_dir = self.path_var2.get()
-
-        print(f"Starting backup:\n  Source: {source_dir}\n  Destination: {dest_dir}")
-        self.sync_directories(source_dir, dest_dir)
-        print("Backup complete.")
-        self.save_last_backup_time()
-        self.update_last_backup_label()
+        # start background sync (force=True when manual backup)
+        self.start_sync_thread(force=True)
 
     def validate_paths(self):
         source_dir = self.path_var1.get()
@@ -400,7 +410,211 @@ class MainFrame(tk.Frame):
             self.dest_path = selected_path  # Save for disk usage calculations
             self.update_disk_health()
 
+    def _poll_msg_queue(self):
+        """Poll queue and update UI. Run on main thread using after()."""
+        try:
+            while True:
+                msg = self.msg_queue.get_nowait()
+                # msg can be tuple (type, payload) or string
+                if isinstance(msg, tuple):
+                    mtype, payload = msg
+                    if mtype == "log":
+                        self._append_terminal(payload)
+                    elif mtype == "progress":
+                        # payload: (bytes_copied, total_bytes, files_processed, total_files)
+                        b_copied, b_total, f_done, f_total = payload
+                        self._update_progress_bar(b_copied, b_total)
+                        # optionally update a small status in terminal
+                        self._append_terminal(
+                            f"Progress: {f_done}/{f_total} files, {self._human_readable(b_copied)}/{self._human_readable(b_total)}")
+                    elif mtype == "done":
+                        self._append_terminal(payload)  # payload string
+                    elif mtype == "error":
+                        self._append_terminal("ERROR: " + payload)
+                else:
+                    # raw string
+                    self._append_terminal(str(msg))
+        except queue.Empty:
+            pass
+        # schedule next poll
+        self.after(200, self._poll_msg_queue)
 
+    def _append_terminal(self, text):
+        # ensure newline
+        if not text.endswith("\n"):
+            text = text + "\n"
+        self.terminal_output.config(state="normal")
+        self.terminal_output.insert(tk.END, text)
+        self.terminal_output.see(tk.END)
+        self.terminal_output.config(state="disabled")
 
+    def _update_progress_bar(self, bytes_copied, total_bytes):
+        if total_bytes <= 0:
+            self.disk_health_bar['value'] = 0
+            return
+        percent = int((bytes_copied / total_bytes) * 100)
+        percent = max(0, min(100, percent))
+        self.disk_health_bar['value'] = percent
+
+    def _human_readable(self, bytes_val):
+        # simple function for readable sizes
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_val < 1024.0:
+                return f"{bytes_val:3.1f} {unit}"
+            bytes_val /= 1024.0
+        return f"{bytes_val:.1f} PB"
+
+    # -------------------------
+    # Thread-safe copy helper
+    # -------------------------
+    def _copy_file_chunked(self, src, dst, chunk_size=1024 * 1024):
+        """Copy a file in chunks and update bytes_copied. Called from worker thread."""
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                while True:
+                    if self.stop_event.is_set():
+                        # cancellation requested
+                        return False
+                    chunk = fsrc.read(chunk_size)
+                    if not chunk:
+                        break
+                    fdst.write(chunk)
+                    self.bytes_copied += len(chunk)
+                    # send progress update occasionally
+                    if self.total_bytes_to_copy:
+                        self.msg_queue.put(("progress", (
+                        self.bytes_copied, self.total_bytes_to_copy, self.files_processed,
+                        self.total_files_to_process)))
+            # preserve metadata
+            shutil.copystat(src, dst)
+            return True
+        except Exception as e:
+            self.msg_queue.put(("error", f"Failed copying {src} -> {dst}: {e}"))
+            return False
+
+    # -------------------------
+    # The worker: incremental, single-pass
+    # -------------------------
+    def _sync_worker(self, source, destination, force=False):
+        """
+        Worker thread: walks source, copies new/updated files.
+        'force' -> copy even if timestamps equal (used by Backup Now)
+        """
+        try:
+            # reset counters
+            self.stop_event.clear()
+            self.bytes_copied = 0
+            self.files_processed = 0
+            self.total_bytes_to_copy = 0
+            self.total_files_to_process = 0
+
+            # First pass: compute totals (sizes & file count) **in background**
+            # This is optional but helps show a meaningful progress bar.
+            for root, dirs, files in os.walk(source):
+                if self.stop_event.is_set():
+                    self.msg_queue.put(("log", "Sync cancelled during scan."))
+                    return
+                for f in files:
+                    fp = os.path.join(root, f)
+                    try:
+                        self.total_bytes_to_copy += os.path.getsize(fp)
+                        self.total_files_to_process += 1
+                    except Exception:
+                        pass
+
+            self.msg_queue.put(("log",
+                                f"Scanning done. {self.total_files_to_process} files, {self._human_readable(self.total_bytes_to_copy)} total."))
+
+            # Second pass: actual copy, file-by-file
+            for root, dirs, files in os.walk(source):
+                if self.stop_event.is_set():
+                    self.msg_queue.put(("log", "Sync cancelled."))
+                    return
+                rel = os.path.relpath(root, source)
+                dest_root = os.path.join(destination, rel) if rel != "." else destination
+                if not os.path.exists(dest_root):
+                    try:
+                        os.makedirs(dest_root, exist_ok=True)
+                    except Exception as e:
+                        self.msg_queue.put(("error", f"Failed to create dir {dest_root}: {e}"))
+                        continue
+
+                for fname in files:
+                    if self.stop_event.is_set():
+                        self.msg_queue.put(("log", "Sync cancelled."))
+                        return
+
+                    src_file = os.path.join(root, fname)
+                    dest_file = os.path.join(dest_root, fname)
+
+                    # skip hidden/temp files (start with . or end with ~ or have .sb-)
+                    base = os.path.basename(src_file)
+                    if base.startswith(".") or base.endswith("~") or ".sb-" in base:
+                        continue
+
+                    try:
+                        # Decide whether to copy
+                        if not os.path.exists(dest_file):
+                            action = "Copied new"
+                            ok = self._copy_file_chunked(src_file, dest_file)
+                        else:
+                            src_mtime = os.path.getmtime(src_file)
+                            dest_mtime = os.path.getmtime(dest_file)
+                            src_size = os.path.getsize(src_file)
+                            dest_size = os.path.getsize(dest_file)
+                            if force or (src_mtime > dest_mtime or src_size != dest_size):
+                                action = "Updated"
+                                ok = self._copy_file_chunked(src_file, dest_file)
+                            else:
+                                action = "Skipped"
+                                ok = True
+
+                        self.files_processed += 1
+                        # log actions (avoid logging every skipped file if verbose)
+                        if action != "Skipped":
+                            self.msg_queue.put(("log", f"{action}: {src_file} -> {dest_file}"))
+                        # also push periodic progress update
+                        if self.total_bytes_to_copy:
+                            self.msg_queue.put(("progress", (
+                            self.bytes_copied, self.total_bytes_to_copy, self.files_processed,
+                            self.total_files_to_process)))
+                    except Exception as e:
+                        self.msg_queue.put(("error", f"Error processing {src_file}: {e}"))
+
+            # finished
+            self.msg_queue.put(("done", "Sync finished."))
+            # update last backup time and persist
+            self.save_last_backup_time()
+            self.update_last_backup_label()
+        except Exception as e:
+            self.msg_queue.put(("error", f"Worker crashed: {e}"))
+
+    # -------------------------
+    # Public start/stop helpers
+    # -------------------------
+    def start_sync_thread(self, force=False):
+        """Start the sync worker in a background thread (non-blocking)."""
+        if self.sync_thread and self.sync_thread.is_alive():
+            self.msg_queue.put(("log", "Sync already running."))
+            return
+        source = self.path_var1.get()
+        destination = self.path_var2.get()
+        if not os.path.isdir(source) or not os.path.isdir(destination):
+            self.msg_queue.put(("log", "Invalid source or destination."))
+            return
+
+        self.stop_event.clear()
+        self.bytes_copied = 0
+        self.files_processed = 0
+        self.sync_thread = threading.Thread(target=self._sync_worker, args=(source, destination, force), daemon=True)
+        self.sync_thread.start()
+        self.msg_queue.put(("log", "Background sync started."))
+
+    def cancel_sync(self):
+        """Request cancellation. Worker will exit soon after next chunk/check."""
+        if self.sync_thread and self.sync_thread.is_alive():
+            self.stop_event.set()
+            self.msg_queue.put(("log", "Cancellation requested."))
 
 
