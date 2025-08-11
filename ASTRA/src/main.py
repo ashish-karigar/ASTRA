@@ -84,7 +84,7 @@ class MainFrame(tk.Frame):
     def __init__(self, master):
         super().__init__(master, bg="#1E1E1E")
         self.master = master
-        self.backup_interval = 10
+        self.backup_interval = 60
         self.remaining_seconds = self.backup_interval * 60
         self.observer = None
         self.timer_running = False
@@ -133,7 +133,7 @@ class MainFrame(tk.Frame):
         backup_freq_label.pack(side="left")
 
         self.backup_interval_entry = tk.Entry(backup_freq_frame, width=5, font=("Arial", 14))
-        self.backup_interval_entry.insert(0, "10")
+        self.backup_interval_entry.insert(0, "60")
         self.backup_interval_entry.pack(side="left", padx=5)
 
         minutes_label = tk.Label(backup_freq_frame, text="minutes", font=("Arial", 14), bg="#1E1E1E")
