@@ -73,11 +73,11 @@ class WatchHandler(FileSystemEventHandler):
             mtime = os.path.getmtime(file_path)
             mod_time = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
 
-            log_line = f"{name:<30} | {status:<9} | {ext:<6} | {size_kb:<8} | {mod_time}"
+            log_line = f"{name:<30}                                                                       | {status:<9} | {ext:<6} | {size_kb:<8} | {mod_time}"
             self.logger(log_line)
 
         except Exception as e:
-            self.logger(f"Error accessing {file_path}: {e}")
+            self.logger(f"File in use {file_path}")
 
 
 class MainFrame(tk.Frame):
@@ -616,5 +616,10 @@ class MainFrame(tk.Frame):
         if self.sync_thread and self.sync_thread.is_alive():
             self.stop_event.set()
             self.msg_queue.put(("log", "Cancellation requested."))
+
+
+
+
+
 
 
